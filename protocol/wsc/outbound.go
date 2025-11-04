@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 
@@ -116,20 +117,33 @@ func (out *Outbound) DialContext(ctx context.Context, network string, destinatio
 	query.Set("addr", destination.String())
 	uri.RawQuery = query.Encode()
 
+	fmt.Println(uri.String())
+
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			h, p, err := net.SplitHostPort(address)
+			host, portStr, err := net.SplitHostPort(address)
 			if err != nil {
 				return nil, err
 			}
-			portInt, err := strconv.ParseUint(p, 10, 16)
+			p64, err := strconv.ParseUint(portStr, 10, 16)
 			if err != nil {
 				return nil, err
 			}
-			return out.dialer.DialContext(ctx, N.NetworkTCP, M.Socksaddr{
-				Fqdn: h,
-				Port: uint16(portInt),
-			})
+			port := uint16(p64)
+
+			sa := M.Socksaddr{Port: port}
+
+			if ip, ok := netip.ParseAddr(host); ok == nil { // Go 1.22: returns (Addr, error)
+				sa.Addr = ip
+			} else {
+				if ipaddr, err := netip.ParseAddr(host); err == nil {
+					sa.Addr = ipaddr
+				} else {
+					sa.Fqdn = host
+				}
+			}
+
+			return out.dialer.DialContext(ctx, N.NetworkTCP, sa)
 		},
 	}
 
