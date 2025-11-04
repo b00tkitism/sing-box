@@ -2,14 +2,18 @@ package wsc
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 
-	"github.com/sagernet/ws"
+	"github.com/coder/websocket"
+	zcrypto "github.com/crypto4people/zoro/crypto"
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -30,6 +34,7 @@ type Outbound struct {
 	outbound.Adapter
 
 	account    string
+	privKey    *ecdsa.PrivateKey
 	path       string
 	logger     logger.ContextLogger
 	serverAddr M.Socksaddr
@@ -44,11 +49,17 @@ func NewOutbound(ctx context.Context, router adapter.Router, lg log.ContextLogge
 		return nil, err
 	}
 
+	priv, err := crypto.HexToECDSA(opts.Auth)
+	if err != nil {
+		return nil, err
+	}
+
 	outbound := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
 			C.TypeWSC, tag, []string{N.NetworkTCP}, opts.DialerOptions,
 		),
-		account: opts.Auth,
+		account: crypto.PubkeyToAddress(priv.PublicKey).Hex(),
+		privKey: priv,
 		path:    opts.Path,
 		logger:  lg,
 		dialer:  dialer,
@@ -105,34 +116,56 @@ func (out *Outbound) DialContext(ctx context.Context, network string, destinatio
 	query.Set("addr", destination.String())
 	uri.RawQuery = query.Encode()
 
-	wsDialer := ws.Dialer{
-		NetDial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			h, p, err := net.SplitHostPort(address)
 			if err != nil {
 				return nil, err
 			}
-
-			portInt, err := strconv.ParseUint(port, 10, 16)
+			portInt, err := strconv.ParseUint(p, 10, 16)
 			if err != nil {
 				return nil, err
 			}
-
 			return out.dialer.DialContext(ctx, N.NetworkTCP, M.Socksaddr{
-				Fqdn: host,
+				Fqdn: h,
 				Port: uint16(portInt),
 			})
 		},
 	}
 
 	if out.useTLS && out.tlsCfg != nil {
-		if (*out.tlsCfg).ServerName == "" {
-			(*out.tlsCfg).ServerName = host
+		if out.tlsCfg.ServerName == "" {
+			out.tlsCfg = out.tlsCfg.Clone()
+			out.tlsCfg.ServerName = host
 		}
-		wsDialer.TLSConfig = out.tlsCfg
+		transport.TLSClientConfig = out.tlsCfg
+	} else if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
 	}
 
-	wsConn, _, _, err := wsDialer.Dial(ctx, uri.String())
+	httpClient := &http.Client{Transport: transport}
+
+	opts := &websocket.DialOptions{
+		HTTPClient:      httpClient,
+		CompressionMode: websocket.CompressionDisabled,
+	}
+
+	wsConn, _, err := websocket.Dial(ctx, uri.String(), opts)
 	if err != nil {
+		return nil, err
+	}
+
+	_, challenge, err := wsConn.Read(ctx)
+	if err != nil {
+		_ = wsConn.Close(websocket.StatusInternalError, "challenge read error")
+		return nil, err
+	}
+
+	sig := zcrypto.SignChallenge(out.privKey, challenge, "tcp", destination.String())
+
+	err = wsConn.Write(ctx, websocket.MessageBinary, sig)
+	if err != nil {
+		_ = wsConn.Close(websocket.StatusInternalError, "challenge write error")
 		return nil, err
 	}
 
