@@ -117,8 +117,6 @@ func (out *Outbound) DialContext(ctx context.Context, network string, destinatio
 	query.Set("addr", destination.String())
 	uri.RawQuery = query.Encode()
 
-	fmt.Println(uri.String())
-
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			host, portStr, err := net.SplitHostPort(address)
